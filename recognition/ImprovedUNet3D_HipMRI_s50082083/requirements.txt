@@ -1,0 +1,7 @@
+# Replace with the exact versions from your Colab runtime before submitting:
+#   pip freeze | grep -iE "^(torch|nibabel|numpy|matplotlib|tqdm)=="
+torch
+nibabel
+numpy
+matplotlib
+tqdm
