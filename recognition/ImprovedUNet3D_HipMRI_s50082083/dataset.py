@@ -23,8 +23,8 @@ import re
 import nibabel as nib
 import numpy as np
 import torch
+from torch.utils.data import Dataset
 from tqdm.auto import tqdm
-
 
 LABEL_NAMES = ["background", "body", "bone", "bladder", "rectum", "prostate"]
 NUM_CLASSES = len(LABEL_NAMES)
@@ -184,3 +184,75 @@ def load_case(cache_dir, case_id):
     img = torch.from_numpy(np.load(img_path).astype(np.float32))
     lab = torch.from_numpy(np.load(lab_path).astype(np.int64))
     return img, lab
+
+
+# --------------------------------------------------------------------------- #
+# 4. Augmentation (training split only)
+# --------------------------------------------------------------------------- #
+def augment(image, label):
+    """Random left-right flip (same for image and label) plus mild intensity jitter.
+
+    image: (1, ..., H, W) float tensor; label: (..., H, W) long tensor.
+    H is the left-right axis, and the pelvis is roughly left-right symmetric,
+    so a flip produces a realistic new example without moving organs
+    relative to each other.
+    """
+    if random.random() < 0.5:
+        image = torch.flip(image, dims=[-2])
+        label = torch.flip(label, dims=[-2])
+    scale = random.uniform(0.9, 1.1)
+    shift = random.uniform(-0.1, 0.1)
+    return image * scale + shift, label
+
+
+# --------------------------------------------------------------------------- #
+# 5. 2D slice dataset
+# --------------------------------------------------------------------------- #
+class HipMRISlices2D(Dataset):
+    """Every axial slice of the given cases at full 256x256 resolution.
+
+    Returns (image (1, H, W) float32, label (H, W) int64).
+    Volumes are memory-mapped, so a slice is read from disk without loading
+    the whole volume into RAM.
+    """
+
+    def __init__(self, cache_dir, case_ids, augment=False):
+        self.cache_dir = cache_dir
+        self.augment = augment
+        self.index = []          # (case_id, slice number)
+        self.has_prostate = []   # used for prostate-biased sampling
+        for cid in case_ids:
+            lab = np.load(_cache_paths(cache_dir, cid)[1], mmap_mode="r")
+            present = (lab == PROSTATE).any(axis=(1, 2))
+            for z in range(lab.shape[0]):
+                self.index.append((cid, z))
+                self.has_prostate.append(bool(present[z]))
+        self._mmaps = {}         # opened lazily inside each DataLoader worker
+
+    def _volume(self, case_id, which):
+        key = (case_id, which)
+        if key not in self._mmaps:
+            path = _cache_paths(self.cache_dir, case_id)[0 if which == "img" else 1]
+            self._mmaps[key] = np.load(path, mmap_mode="r")
+        return self._mmaps[key]
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, i):
+        cid, z = self.index[i]
+        image = torch.from_numpy(np.array(self._volume(cid, "img")[z], dtype=np.float32))[None]
+        label = torch.from_numpy(np.array(self._volume(cid, "lab")[z], dtype=np.int64))
+        if self.augment:
+            image, label = augment(image, label)
+        return image, label
+
+    def sample_weights(self, prostate_fraction=0.5):
+        """Per-slice weights so that about `prostate_fraction` of sampled slices
+        contain prostate (only ~20% of slices do, and the prostate is 0.1% of voxels)."""
+        n_pos = sum(self.has_prostate)
+        n_neg = len(self.has_prostate) - n_pos
+        if n_pos == 0 or n_neg == 0:
+            return torch.ones(len(self.has_prostate), dtype=torch.double)
+        w_pos, w_neg = prostate_fraction / n_pos, (1 - prostate_fraction) / n_neg
+        return torch.tensor([w_pos if p else w_neg for p in self.has_prostate], dtype=torch.double)
