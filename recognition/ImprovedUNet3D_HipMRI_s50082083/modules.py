@@ -3,11 +3,13 @@ Model components (PyTorch only, no NumPy, as required by the spec).
 
 Contains:
     UNet         standard U-Net (Ronneberger et al., 2015), the 2D baseline
+    DiceCELoss   soft Dice + cross-entropy loss for extreme class imbalance
     build_model  name -> model factory used by train.py and predict.py
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def _ops(dims):
@@ -99,6 +101,32 @@ class UNet(nn.Module):
         for up in self.ups:
             x = up(x, skips.pop())
         return self.head(x)
+
+
+class DiceCELoss(nn.Module):
+    """Cross-entropy + (1 - mean soft Dice over classes).
+
+    Cross-entropy gives stable per-voxel gradients; the Dice term weights every
+    class equally regardless of size, so the model cannot score well by
+    ignoring the prostate (0.1% of voxels). Dice uses softmax probabilities
+    (soft Dice) so it is differentiable.
+    """
+
+    def __init__(self, num_classes=6, smooth=1e-5):
+        super().__init__()
+        self.num_classes = num_classes
+        self.smooth = smooth
+
+    def forward(self, logits, target):
+        logits = logits.float()                              # stable under mixed precision
+        ce = F.cross_entropy(logits, target)
+        probs = logits.softmax(dim=1)                        # softmax BEFORE Dice
+        onehot = F.one_hot(target, self.num_classes).movedim(-1, 1).float()
+        dims = (0,) + tuple(range(2, logits.ndim))           # sum over batch + space
+        intersection = (probs * onehot).sum(dims)
+        total = probs.sum(dims) + onehot.sum(dims)
+        dice = (2 * intersection + self.smooth) / (total + self.smooth)
+        return ce + (1 - dice.mean())
 
 
 # name -> (constructor, "2d" or "3d" input mode). More models are added here later.
