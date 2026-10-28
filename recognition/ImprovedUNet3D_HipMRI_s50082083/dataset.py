@@ -9,6 +9,7 @@ Pipeline:
     3. preprocess()      one-off: z-score normalise, fix depth to 128 slices, store
                          each case as uncompressed .npy so slices can be read fast
     4. HipMRISlices2D    PyTorch Dataset of full-resolution axial slices (2D models)
+    5. HipMRIVolumes3D   PyTorch Dataset of whole volumes downsampled x2 (3D models)
 
 Array layout after preprocessing is (D, H, W) = (axial slice, x, y):
     D = superior-inferior (128 axial slices), H = left-right, W = anterior-posterior.
@@ -23,6 +24,7 @@ import re
 import nibabel as nib
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
@@ -256,3 +258,49 @@ class HipMRISlices2D(Dataset):
             return torch.ones(len(self.has_prostate), dtype=torch.double)
         w_pos, w_neg = prostate_fraction / n_pos, (1 - prostate_fraction) / n_neg
         return torch.tensor([w_pos if p else w_neg for p in self.has_prostate], dtype=torch.double)
+
+
+# --------------------------------------------------------------------------- #
+# 6. 3D volume dataset
+# --------------------------------------------------------------------------- #
+def downsample(image, label, scale):
+    """Shrink a (D, H, W) image/label pair by `scale` in every direction.
+
+    Image: trilinear (smooth averaging). Label: nearest-neighbour, so every
+    voxel keeps a real class value (averaging labels would invent classes).
+    """
+    if scale == 1:
+        return image, label
+    img = F.interpolate(image[None, None], scale_factor=1 / scale, mode="trilinear", align_corners=False)[0, 0]
+    if label is None:
+        return img, None
+    lab = F.interpolate(label[None, None].float(), scale_factor=1 / scale, mode="nearest")[0, 0]
+    return img, lab.long()
+
+
+class HipMRIVolumes3D(Dataset):
+    """Whole volumes downsampled by `scale` (x2: 128x256x256 -> 64x128x128).
+
+    All volumes are downsampled once and kept in RAM (~3 MB each), so training
+    never waits on disk. Returns (image (1, D, H, W) float32, label (D, H, W) int64).
+    """
+
+    def __init__(self, cache_dir, case_ids, scale=2, augment=False):
+        self.case_ids = list(case_ids)
+        self.augment = augment
+        self.images, self.labels = [], []
+        for cid in tqdm(self.case_ids, desc=f"Loading volumes (x{scale} downsampled)", leave=False):
+            image, label = load_case(cache_dir, cid)
+            image, label = downsample(image, label, scale)
+            self.images.append(image.half())
+            self.labels.append(label.to(torch.uint8))
+
+    def __len__(self):
+        return len(self.case_ids)
+
+    def __getitem__(self, i):
+        image = self.images[i].float()[None]
+        label = self.labels[i].long()
+        if self.augment:
+            image, label = augment(image, label)
+        return image, label
