@@ -46,7 +46,8 @@ def save_figure(image, label, pred, case_id, dice, path):
     """Four panels at the axial slice through the centre of the true prostate."""
     zs = np.where((label == PROSTATE).any(axis=(1, 2)))[0]
     z = int(zs.mean()) if len(zs) else image.shape[0] // 2
-    img, gt, pr = image[z].T, label[z].T, pred[z].T          # transpose: display like the audit plots
+    # transpose + origin="upper": front of the body (bladder) at the top, as radiologists view axial MR
+    img, gt, pr = image[z].T, label[z].T, pred[z].T
 
     fp = (pr == PROSTATE) & (gt != PROSTATE)
     fn = (gt == PROSTATE) & (pr != PROSTATE)
@@ -58,11 +59,11 @@ def save_figure(image, label, pred, case_id, dice, path):
     panels = [("input MR", None), ("ground truth", label_rgb(gt)),
               ("prediction", label_rgb(pr)), ("prostate errors: FP red, FN blue", errors)]
     for ax, (title, overlay) in zip(axes, panels):
-        ax.imshow(img, cmap="gray", origin="lower")
+        ax.imshow(img, cmap="gray", origin="upper")
         if overlay is not None:
-            ax.imshow(overlay, origin="lower", alpha=0.6 if title != panels[-1][0] else 1.0)
+            ax.imshow(overlay, origin="upper", alpha=0.6 if title != panels[-1][0] else 1.0)
         if title.startswith("prostate errors"):
-            ax.contour(gt == PROSTATE, levels=[0.5], colors="yellow", linewidths=0.8, origin="lower")
+            ax.contour(gt == PROSTATE, levels=[0.5], colors="yellow", linewidths=0.8, origin="upper")
         ax.set_title(title, fontsize=10)
         ax.axis("off")
     fig.suptitle(f"case {case_id}, slice {z}  |  prostate Dice {dice[PROSTATE]:.3f}", fontsize=11)
@@ -90,7 +91,7 @@ def main():
     print("case      " + "".join(f"{n:>11}" for n in LABEL_NAMES))
     for cid in case_ids:
         image, label = load_case(args.cache_dir, cid)
-        pred = predict_volume(model, image, mode, device)
+        pred = predict_volume(model, image, mode, device, scale=ckpt["config"].get("scale", 2))
         dice, iou = dice_iou_per_class(pred, label)
         results[cid] = {"dice": dice, "iou": iou}
         print(f"{cid:<10}" + "".join(f"{d:>11.3f}" for d in dice))
