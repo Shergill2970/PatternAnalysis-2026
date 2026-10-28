@@ -10,7 +10,9 @@ import random
 import numpy as np
 import torch
 
-from dataset import LABEL_NAMES, NUM_CLASSES, load_case, patient_of
+import torch.nn.functional as F
+
+from dataset import LABEL_NAMES, NUM_CLASSES, downsample, load_case, patient_of
 
 
 def seed_everything(seed):
@@ -22,11 +24,13 @@ def seed_everything(seed):
 
 
 @torch.no_grad()
-def predict_volume(model, image, mode, device, batch_size=32, amp=True):
+def predict_volume(model, image, mode, device, batch_size=32, amp=True, scale=2):
     """Predict a full-resolution class map (D, H, W) for one volume.
 
-    mode "2d": run the model slice by slice along D and stack the results,
-    so 2D and 3D models are always scored on identical full-size volumes.
+    mode "2d": run the model slice by slice along D and stack the results.
+    mode "3d": downsample the volume by `scale`, run the model once, then
+    upsample the class scores back to full size before taking the argmax.
+    Either way, 2D and 3D models are scored on identical full-size volumes.
     """
     model.eval()
     use_amp = amp and device.type == "cuda"
@@ -38,6 +42,13 @@ def predict_volume(model, image, mode, device, batch_size=32, amp=True):
                 logits = model(x)
             preds.append(logits.argmax(dim=1).cpu())
         return torch.cat(preds)
+    if mode == "3d":
+        small, _ = downsample(image, None, scale)
+        x = small[None, None].to(device)                                   # (1, 1, d, h, w)
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            logits = model(x)
+        logits = F.interpolate(logits.float(), size=tuple(image.shape), mode="trilinear", align_corners=False)
+        return logits.argmax(dim=1)[0].cpu()
     raise ValueError(f"Unsupported mode '{mode}'")
 
 
@@ -61,12 +72,12 @@ def dice_iou_per_class(pred, target, num_classes=NUM_CLASSES):
     return dice, iou
 
 
-def evaluate_cases(model, mode, cache_dir, case_ids, device, batch_size=32, amp=True):
+def evaluate_cases(model, mode, cache_dir, case_ids, device, batch_size=32, amp=True, scale=2):
     """Per-case Dice/IoU for every case, computed at full resolution."""
     results = {}
     for cid in case_ids:
         image, label = load_case(cache_dir, cid)
-        pred = predict_volume(model, image, mode, device, batch_size, amp)
+        pred = predict_volume(model, image, mode, device, batch_size, amp, scale)
         dice, iou = dice_iou_per_class(pred, label)
         results[cid] = {"dice": dice, "iou": iou}
     return results

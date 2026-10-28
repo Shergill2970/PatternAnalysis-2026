@@ -1,9 +1,14 @@
 """
 Train, validate and test a segmentation model on HipMRI.
 
-Example (Colab, 2D U-Net baseline):
+Examples (Colab):
+    # 2D U-Net baseline on full-resolution axial slices
     python train.py --data-root /content/hipmri3d --cache-dir /content/cache \
         --out-dir /content/drive/MyDrive/comp3710_runs/unet2d --model unet2d --epochs 30
+    # 3D Improved U-Net on whole volumes downsampled x2
+    python train.py --data-root /content/hipmri3d --cache-dir /content/cache \
+        --out-dir /content/drive/MyDrive/comp3710_runs/iunet3d --model iunet3d \
+        --epochs 150 --batch-size 2 --lr 5e-4
 
 Each epoch: train on the training patients, evaluate prostate Dice on the
 validation patients at full resolution, save `last.pt` (for resuming) and
@@ -19,8 +24,8 @@ import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm.auto import tqdm
 
-from dataset import (HipMRISlices2D, case_ids_for, find_cases, preprocess,
-                     split_patients)
+from dataset import (HipMRISlices2D, HipMRIVolumes3D, case_ids_for, find_cases,
+                     preprocess, split_patients)
 from modules import DiceCELoss, build_model
 from utils import (evaluate_cases, plot_history, print_summary, save_json,
                    seed_everything, summarise)
@@ -38,6 +43,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--workers", type=int, default=2)
     p.add_argument("--depth", type=int, default=128, help="slices per volume after crop/pad")
+    p.add_argument("--scale", type=int, default=2, help="3D models: downsampling factor per axis")
     p.add_argument("--prostate-fraction", type=float, default=0.5,
                    help="share of training slices sampled from slices containing prostate")
     p.add_argument("--n-val", type=int, default=6, help="validation patients")
@@ -84,8 +90,10 @@ def main():
         loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
                             num_workers=args.workers, pin_memory=device.type == "cuda",
                             drop_last=True, persistent_workers=args.workers > 0)
-    else:
-        raise ValueError(f"Mode '{mode}' not supported yet")
+    else:   # 3D: whole downsampled volumes, shuffled each epoch
+        train_ds = HipMRIVolumes3D(args.cache_dir, train_ids, scale=args.scale, augment=True)
+        loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0,
+                            pin_memory=device.type == "cuda", drop_last=True)
     print(f"Training samples per epoch: {len(train_ds):,}")
 
     criterion = DiceCELoss()
@@ -126,7 +134,7 @@ def main():
         train_time = time.time() - t0
         peak_gb = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0.0
 
-        val = summarise(evaluate_cases(model, mode, args.cache_dir, val_ids, device, amp=amp))
+        val = summarise(evaluate_cases(model, mode, args.cache_dir, val_ids, device, amp=amp, scale=args.scale))
         record = {"epoch": epoch, "train_loss": running / max(steps, 1),
                   "val_prostate_dice": val["prostate_dice"],
                   "val_mean_fg_dice": val["mean_foreground_dice"],
@@ -137,7 +145,7 @@ def main():
               f"val prostate Dice {val['prostate_dice']:.3f} | val organs Dice {val['mean_foreground_dice']:.3f} | "
               f"{train_time:.0f}s | peak VRAM {peak_gb:.2f} GB")
 
-        config = {"model": args.model, "depth": args.depth}
+        config = {"model": args.model, "depth": args.depth, "scale": args.scale}
         if val["prostate_dice"] > best_dice:
             best_dice = val["prostate_dice"]
             torch.save({"model": model.state_dict(), "config": config, "epoch": epoch,
@@ -153,7 +161,7 @@ def main():
     # ---- final test: best checkpoint, run once ----
     ckpt = torch.load(best_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
-    test_results = evaluate_cases(model, mode, args.cache_dir, test_ids, device, amp=amp)
+    test_results = evaluate_cases(model, mode, args.cache_dir, test_ids, device, amp=amp, scale=args.scale)
     test_summary = summarise(test_results)
     print_summary(test_summary, f"TEST — {args.model}, best epoch {ckpt['epoch']}")
     save_json({"summary": test_summary, "per_case": test_results, "best_epoch": ckpt["epoch"],
