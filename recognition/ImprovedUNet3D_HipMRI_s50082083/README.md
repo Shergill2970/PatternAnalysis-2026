@@ -98,6 +98,8 @@ Exact versions used for the GPU Lab runs (also in `requirements.txt`):
 
 Hardware: Google Colab (NVIDIA T4) for the 2D U-Net and epochs 1–118 of the x2 3D model, with Colab's preinstalled PyTorch; the EAIT Virtual GPU Lab (NVIDIA L4) for everything else, in a virtual environment with the versions above (the lab's shared environment failed to load cuDNN for any convolution). All runs use seed 42; the patient split is regenerated identically from that seed and saved as `split.json` in each run folder. GPU training is not bit-for-bit deterministic, so re-runs can differ slightly in the last decimal places.
 
+**Compute issues encountered.** Compute limits affected two runs: Colab's free GPU quota stopped the x2 3D run at epoch 118, which was resumed from its saved checkpoint on the GPU Lab (`--resume`), and the full-resolution run was limited to 80 epochs to fit the remaining GPU time. On the GPU Lab, the shared environment's PyTorch could not load a cuDNN library and every convolution failed; installing PyTorch 2.11.0+cu128 in a private virtual environment fixed this. Browser uploads to the lab sometimes produced incomplete or duplicated files, so every transferred checkpoint and archive was verified (file size in bytes, archive integrity test, and loading each checkpoint to confirm its stored model name and epoch) before use. A GPU Lab outage on the final day prevented downloading two evaluation figures; `regional_dice.png` and `per_patient_prostate.png` were redrawn with the same plotting code from the saved evaluation results, and two prediction figures were omitted.
+
 ## Data, preprocessing and splits
 
 **Data.** CSIRO *Labelled weekly MR images of the male pelvis* (HipMRI): 211 MR volumes from 38 patients, each with a 6-class label volume (0 background, 1 body, 2 bone, 3 bladder, 4 rectum, 5 prostate). Most patients were scanned weekly, up to 8 times. The data is not included in this repository (licence CC BY-NC-ND 4.0).
@@ -142,7 +144,7 @@ python evaluate.py --runs-dir RUNS --models $M --cache-dir CACHE --out-dir RUNS/
 python evaluate.py --runs-dir RUNS --models $M --cache-dir CACHE --out-dir RUNS/evaluation --thresholds RUNS/eval_val/thresholds.json
 ```
 
-`DATA` is the folder containing the HipMRI `.nii.gz` files (searched recursively); `CACHE` is created on the first run. `predict.py` prints, for example:
+`DATA` is the folder containing the HipMRI `.nii.gz` files (searched recursively); `CACHE` is created on the first run. `predict.py` prints per-class Dice for each scan in this format (illustrative values):
 
 ```
 Model iunet3d (best epoch 97)
@@ -304,11 +306,29 @@ The slice-by-slice plots below compare the two 2D baselines with the x2 3D model
 
 ## Artificial Intelligence Usage Disclosure
 
-*TODO before submitting: rewrite this section in your own words. It must state (1) which AI tools were used, (2) which tasks they assisted with, and (3) how you audited, verified and tested the output.*
+**Tool used:** Claude (Anthropic; model Claude Opus 5.5), used through a chat interface throughout the project.
 
-- **Tools:** Claude (Anthropic).
-- **Tasks:** *TODO*
-- **How the output was verified:** *TODO*
+**What AI assisted with.** AI assistance was substantial, and I want to be clear about its extent:
+
+- **Planning:** proposing the project pathway (2D U-Net baseline, 2D Improved U-Net, 3D Improved U-Net), the patient-level split and the commit plan.
+- **Data exploration:** writing the Colab notebooks for the data audit and the x2/x4 downsampling resolution test.
+- **Feasibility review:** drafting the one-page review from the numbers my data audit produced.
+- **Code:** generating the code in `dataset.py`, `modules.py`, `utils.py`, `train.py`, `predict.py` and `evaluate.py`, and the Colab notebooks with a check for each commit. I committed the code in steps, each after running its check.
+- **Debugging:** diagnosing Colab path errors, corrupted file uploads to the GPU Lab, and the GPU Lab's shared-environment cuDNN failure (fixed by installing PyTorch in my own virtual environment).
+- **Analysis and writing:** suggesting the diagnostics (per-patient tables, slice-by-slice Dice, the sagittal comparison, what the missed prostate was predicted as), helping interpret the results, and drafting the README text, which I reviewed and edited.
+- **Figures:** the final `regional_dice.png` and `per_patient_prostate.png` were redrawn by Claude with the same plotting code from my evaluation results, because the GPU Lab was unavailable when I needed to download the original files.
+- **Learning:** explanations of Dice, soft versus hard Dice, U-Nets, 2D versus 3D convolutions, epochs, and the Improved U-Net's components.
+
+**How I verified the AI-generated work.**
+
+- **Every code commit was checked on the real data before the next step:** 211 image/label pairs and 38 patients found; a 26/6/6 patient split with assertions confirming no patient overlap; preprocessed volumes of shape (128, 256, 256) with mean 0 and standard deviation 1; label overlays inspected to confirm the prostate outline sits between bladder and rectum; model output shapes and parameter counts; the loss near 0 for a perfect prediction and Dice 0.75 for a hand-worked 4-square example.
+- **Training was monitored** through loss and validation curves for every run, and a re-scored test scan reproduced the score saved during training exactly.
+- **Evaluation metrics were unit-tested** on synthetic cases with known answers (extent error and its sign, leakage volume, HD95, holes, bladder distance, number of prostate pieces) before being used on real results.
+- **Errors were caught by checks rather than trusted:** a checkpoint uploaded under the wrong model name was detected because its stored configuration said `iunet3d`, not `unet2d`; corrupted uploads were detected by comparing file sizes in bytes and testing archive integrity; the cuDNN failure was isolated with a small convolution test before any training.
+- **No test-set peeking:** anatomy-check thresholds were chosen on validation patients only, and each model's test set was evaluated once with its best validation checkpoint.
+- **Figures were inspected** for anatomical plausibility, and when results contradicted an earlier hypothesis (the 3D bladder failure, the validation and test rankings disagreeing), the README was corrected rather than the evidence selected to fit.
+
+I ran all experiments, made the commits, and am responsible for every line of code and every claim in this report.
 
 ## References
 
