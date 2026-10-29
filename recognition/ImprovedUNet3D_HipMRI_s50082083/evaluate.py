@@ -338,13 +338,14 @@ def calibrate(rows, models, path):
     Thresholds are fixed here and only then applied to the test patients."""
     limits = {}
     print("\nCheck-A calibration on validation scans (hole volume, mL)")
-    print(f"{'model':<10}{'acceptable: median / p90 / max':>34}{'unacceptable values':>28}{'threshold':>11}")
+    print(f"{'model':<14}{'acceptable: median / p90 / max':<34}{'threshold':>10}   unacceptable values")
     for k in models:
         ok = [r["holes_ml"] for r in rows if r["model"] == k and not r["unacceptable"]]
         bad = [r["holes_ml"] for r in rows if r["model"] == k and r["unacceptable"]]
         limits[k] = max(HOLE_LIMIT_ML, float(np.percentile(ok, CALIBRATION_PERCENTILE))) if ok else HOLE_LIMIT_ML
         okd = f"{np.median(ok):.1f} / {np.percentile(ok, 90):.1f} / {max(ok):.1f}" if ok else "-"
-        print(f"{k:<10}{okd:>34}{', '.join(f'{v:.1f}' for v in bad) or '-':>28}{limits[k]:>11.1f}")
+        badd = ", ".join(f"{v:.1f}" for v in bad) or "-"
+        print(f"{k:<14}{okd:<34}{limits[k]:>10.1f}   {badd}")
     save_json({"hole_limit_ml": limits, "percentile": CALIBRATION_PERCENTILE}, path)
     print(f"Saved {path}")
 
