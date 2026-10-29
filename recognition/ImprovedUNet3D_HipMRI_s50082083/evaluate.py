@@ -13,9 +13,12 @@ For every trained model and every test scan this script measures, at full resolu
         C. predicted prostate split into several pieces
     - inference time and peak inference VRAM per scan
 
-Example:
-    python evaluate.py --runs-dir /content/drive/MyDrive/comp3710_runs \
-        --cache-dir /content/cache --out-dir /content/drive/MyDrive/comp3710_runs/evaluation
+Examples:
+    # 1. choose the anatomy-check thresholds on the VALIDATION patients (never on test)
+    python evaluate.py --runs-dir RUNS --cache-dir CACHE --out-dir RUNS/eval_val --split val --calibrate
+    # 2. evaluate on the TEST patients using those saved thresholds
+    python evaluate.py --runs-dir RUNS --cache-dir CACHE --out-dir RUNS/evaluation \
+        --thresholds RUNS/eval_val/thresholds.json
 
 Writes per_case.csv, summary.json, summary.md (README-ready tables) and figures.
 Metrics are averaged over each patient's scans first, then mean +/- std across patients.
@@ -40,14 +43,16 @@ from utils import dice_iou_per_class, predict_volume, save_json
 
 BLADDER, RECTUM = 3, 4
 GAP_LIMIT_MM = 10.0        # check B: bladder must lie within this distance of the prostate
-HOLE_LIMIT_ML = 1.0        # check A: enclosed background larger than this is flagged
+HOLE_LIMIT_ML = 1.0        # check A default; replaced per model by validation calibration
+CALIBRATION_PERCENTILE = 90  # check A threshold = 90th percentile of holes in ACCEPTABLE validation scans
 PIECE_MIN_ML = 0.1         # check C: prostate pieces smaller than this are ignored
 BAD_PROSTATE, BAD_BLADDER = 0.7, 0.5   # a scan is "clinically unacceptable" below these Dice
 
 # Colour-blind-safe categorical slots (fixed order), plus text/grid ink
 MODEL_STYLE = {"unet2d": ("2D U-Net", "#2a78d6"),
                "iunet2d": ("2D Improved U-Net", "#eb6834"),
-               "iunet3d": ("3D Improved U-Net (x2)", "#1baf7a")}
+               "iunet3d": ("3D Improved U-Net (x2)", "#1baf7a"),
+               "iunet3d_full": ("3D Improved U-Net (full res)", "#eda100")}
 INK, INK_2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 
 
@@ -59,6 +64,10 @@ def parse_args():
     p.add_argument("--out-dir", required=True)
     p.add_argument("--figure-cases", nargs="+", default=["015_w6", "038_w0", "014_w1"],
                    help="scans to draw slice-by-slice Dice plots for")
+    p.add_argument("--split", choices=["val", "test"], default="test", help="which patients to evaluate")
+    p.add_argument("--calibrate", action="store_true",
+                   help="(with --split val) choose check-A thresholds and save thresholds.json")
+    p.add_argument("--thresholds", default=None, help="thresholds.json from a validation calibration run")
     return p.parse_args()
 
 
@@ -125,16 +134,16 @@ def prostate_pieces(seg, voxel_ml):
     return int((sizes >= PIECE_MIN_ML).sum())
 
 
-def anatomy_checks(seg, spacing, voxel_ml):
+def anatomy_checks(seg, spacing, voxel_ml, hole_limit=HOLE_LIMIT_ML):
     holes = enclosed_background_ml(seg, voxel_ml)
     gap = bladder_gap_mm(seg, spacing)
     pieces = prostate_pieces(seg, voxel_ml)
-    flags = {"A_holes": bool(holes > HOLE_LIMIT_ML), "B_bladder": bool(gap > GAP_LIMIT_MM), "C_pieces": pieces > 1}
+    flags = {"A_holes": bool(holes > hole_limit), "B_bladder": bool(gap > GAP_LIMIT_MM), "C_pieces": pieces > 1}
     return {"holes_ml": float(holes), "bladder_gap_mm": gap, "prostate_pieces": pieces,
             **flags, "flagged": any(flags.values())}
 
 
-def case_metrics(pred, label, spacing):
+def case_metrics(pred, label, spacing, hole_limit=HOLE_LIMIT_ML):
     """All per-scan metrics for one prediction (numpy (D, H, W) integer maps)."""
     voxel_ml = float(np.prod(spacing)) / 1000.0
     dice_all, iou_all = dice_iou_per_class(torch.from_numpy(pred), torch.from_numpy(label))
@@ -160,7 +169,7 @@ def case_metrics(pred, label, spacing):
     m["leak_bladder_ml"] = float((pr & (label == BLADDER)).sum() * voxel_ml)
     m["prostate_hd95_mm"] = hd95(pr, gt, spacing)
     m["unacceptable"] = bool(dice_all[PROSTATE] < BAD_PROSTATE or dice_all[BLADDER] < BAD_BLADDER)
-    m.update(anatomy_checks(pred, spacing, voxel_ml))
+    m.update(anatomy_checks(pred, spacing, voxel_ml, hole_limit))
 
     g, p, inter = gt.sum((1, 2)), pr.sum((1, 2)), (gt & pr).sum((1, 2))
     slice_dice = np.where(g + p > 0, 2 * inter / np.maximum(g + p, 1), np.nan)
@@ -185,9 +194,9 @@ def fmt(ms, digits=3):
     return "–" if not np.isfinite(m) else f"{m:.{digits}f} ± {s:.{digits}f}"
 
 
-def write_markdown(summary, models, path):
+def write_markdown(summary, models, path, split="test", hole_limits=None):
     name = lambda k: MODEL_STYLE.get(k, (k,))[0]
-    lines = ["## Evaluation summary (test patients; per-patient mean ± std)", ""]
+    lines = [f"## Evaluation summary ({split} patients; per-patient mean ± std)", ""]
     lines += ["### Prostate accuracy by region", "",
               "| Model | Overall Dice | Apex Dice | Mid Dice | Base Dice | HD95 (mm) |",
               "| --- | --- | --- | --- | --- | --- |"]
@@ -218,7 +227,9 @@ def write_markdown(summary, models, path):
                      f"{r['train_epoch_s_median']:.0f} | {r['train_vram_gb']:.2f} | {r['epochs']} ({r['best_epoch']}) |")
     lines += ["", "Training times come from different GPUs for different runs; compare them within a GPU type only.", "",
               "### Anatomy checks (no ground truth needed)", "",
-              f"A: background hole > {HOLE_LIMIT_ML} mL inside the body · B: bladder missing or > {GAP_LIMIT_MM:.0f} mm "
+              "A: background hole inside the body larger than the model's threshold (" +
+              ", ".join(f"{name(k)} {hole_limits.get(k, HOLE_LIMIT_ML):.1f} mL" for k in models) +
+              f") · B: bladder missing or > {GAP_LIMIT_MM:.0f} mm "
               f"from prostate · C: prostate in several pieces. 'Unacceptable' = prostate Dice < {BAD_PROSTATE} or "
               f"bladder Dice < {BAD_BLADDER}.", "",
               "| Model | Scans flagged (A / B / C) | Unacceptable scans | Unacceptable and flagged | Flagged but acceptable |",
@@ -321,6 +332,23 @@ def plot_per_patient(rows, models, path):
     plt.close(fig)
 
 
+def calibrate(rows, models, path):
+    """Pick each model's check-A threshold from the validation scans it got RIGHT:
+    the 90th percentile of their hole volume, so ~10% of acceptable scans are flagged.
+    Thresholds are fixed here and only then applied to the test patients."""
+    limits = {}
+    print("\nCheck-A calibration on validation scans (hole volume, mL)")
+    print(f"{'model':<10}{'acceptable: median / p90 / max':>34}{'unacceptable values':>28}{'threshold':>11}")
+    for k in models:
+        ok = [r["holes_ml"] for r in rows if r["model"] == k and not r["unacceptable"]]
+        bad = [r["holes_ml"] for r in rows if r["model"] == k and r["unacceptable"]]
+        limits[k] = max(HOLE_LIMIT_ML, float(np.percentile(ok, CALIBRATION_PERCENTILE))) if ok else HOLE_LIMIT_ML
+        okd = f"{np.median(ok):.1f} / {np.percentile(ok, 90):.1f} / {max(ok):.1f}" if ok else "-"
+        print(f"{k:<10}{okd:>34}{', '.join(f'{v:.1f}' for v in bad) or '-':>28}{limits[k]:>11.1f}")
+    save_json({"hole_limit_ml": limits, "percentile": CALIBRATION_PERCENTILE}, path)
+    print(f"Saved {path}")
+
+
 # --------------------------------------------------------------------------- #
 def main():
     args = parse_args()
@@ -329,8 +357,13 @@ def main():
     with open(os.path.join(args.cache_dir, "meta.json")) as f:
         meta = json.load(f)
     with open(os.path.join(args.runs_dir, args.models[0], "split.json")) as f:
-        test_ids = json.load(f)["test_cases"]
-    print(f"Device: {device} | {len(test_ids)} test scans | models: {args.models}")
+        test_ids = json.load(f)[f"{args.split}_cases"]
+    hole_limits = {}
+    if args.thresholds:
+        with open(args.thresholds) as f:
+            hole_limits = json.load(f)["hole_limit_ml"]
+    print(f"Device: {device} | {len(test_ids)} {args.split} scans | models: {args.models} | "
+          f"check-A thresholds: {hole_limits or 'default'}")
 
     rows, slices, summary, gt_checks = [], {}, {}, []
     labels = {}
@@ -360,7 +393,8 @@ def main():
                 torch.cuda.synchronize()
                 vrams.append(torch.cuda.max_memory_allocated() / 1e9)
             times.append(time.perf_counter() - t0)
-            m, s = case_metrics(pred.numpy(), labels[cid], np.array(meta[cid]["spacing_dhw"]))
+            m, s = case_metrics(pred.numpy(), labels[cid], np.array(meta[cid]["spacing_dhw"]),
+                                hole_limits.get(k, HOLE_LIMIT_ML))
             rows.append({"model": k, "case": cid, "patient": patient_of(cid), **m})
             slices.setdefault(cid, {})[k] = s
             print(f"  {k:8s} {cid}: prostate {m['dice_prostate']:.3f} | apex {m['prostate_dice_apex']:.3f} "
@@ -403,7 +437,9 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     save_json(summary, os.path.join(args.out_dir, "summary.json"))
-    write_markdown(summary, args.models, os.path.join(args.out_dir, "summary.md"))
+    write_markdown(summary, args.models, os.path.join(args.out_dir, "summary.md"), args.split, hole_limits)
+    if args.calibrate:
+        calibrate(rows, args.models, os.path.join(args.out_dir, "thresholds.json"))
     plot_regional(summary, args.models, os.path.join(args.out_dir, "regional_dice.png"))
     plot_per_patient(rows, args.models, os.path.join(args.out_dir, "per_patient_prostate.png"))
     for cid in args.figure_cases:
